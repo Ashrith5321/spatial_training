@@ -1,0 +1,9 @@
+# @package _global_
+resources:
+  ray_address: local
+  osm_gb: 16
+  num_vlms: 1
+  num_sims: 1
+  habitat_conda_env: vln
+  sim_gpu_fraction: 0.05
+  vlm_gpu_fraction: 0.85

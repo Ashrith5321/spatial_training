@@ -70,7 +70,7 @@ class VLMWorker:
         import torch
         self.offset=0
         # self.past_key_values=StaticCache(config=self.model.config, offloading=self.offload_cache,max_cache_len=70000)
-        self.past_key_values=None#DynamicCache(config=self.model.config, offloading=self.offload_cache)
+        self.past_key_values=None
         self.outputs = defaultdict(list)
         self.cumulative_inputs = None
         self.seq_keep_mask = None
@@ -921,8 +921,15 @@ class VLMTrainingMixin:
             )
             # Log the norm (Detect explosions if this spikes > 10.0)
             metrics['train/grad_norm'] = grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm
-            
-            self.optimizer.step()
+
+            # NaN guard: a non-finite loss makes clip_grad_norm_ spread NaN into
+            # every gradient; stepping would poison the weights permanently.
+            # DDP all-reduces grads, so the norm (and this decision) is identical
+            # on every rank.
+            if torch.isfinite(torch.as_tensor(metrics['train/grad_norm'])):
+                self.optimizer.step()
+            else:
+                print("WARNING: non-finite grad norm, skipping optimizer step to protect weights")
             self.scheduler.step()
             metrics['train/lr'] = self.scheduler.get_last_lr()[0]
             self.optimizer.zero_grad()
@@ -1010,8 +1017,15 @@ class VLMTrainingMixin:
             )
             # Log the norm (Detect explosions if this spikes > 10.0)
             metrics['train/grad_norm'] = grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm
-            
-            self.optimizer.step()
+
+            # NaN guard: a non-finite loss makes clip_grad_norm_ spread NaN into
+            # every gradient; stepping would poison the weights permanently.
+            # DDP all-reduces grads, so the norm (and this decision) is identical
+            # on every rank.
+            if torch.isfinite(torch.as_tensor(metrics['train/grad_norm'])):
+                self.optimizer.step()
+            else:
+                print("WARNING: non-finite grad norm, skipping optimizer step to protect weights")
             self.scheduler.step()
             metrics['train/lr'] = self.scheduler.get_last_lr()[0]
             self.optimizer.zero_grad()

@@ -629,3 +629,234 @@ class WaypointRewardMeasure(Measure):
 #         self._previous_xy_location = (a_y, a_x)
 #         map_agent_pos = (a_x, a_y)
 #         return self._top_down_map, map_agent_pos
+
+
+import cv2
+from habitat.tasks.nav.nav import TopDownMap
+from habitat.utils.visualizations import maps
+
+@registry.register_measure(name="MultiFloorTopDownMap")
+class MultiFloorTopDownMap(TopDownMap):
+    """TopDownMap that renders all navigable floors side by side."""
+
+    def _get_uuid(self, *args, **kwargs):
+        return "top_down_map"
+
+    def _detect_floors(self):
+        bounds = self._sim.pathfinder.get_bounds()
+        min_y, max_y = bounds[0][1], bounds[1][1]
+        mpp = maps.calculate_meters_per_pixel(self._map_resolution, sim=self._sim)
+
+        nav_heights = []
+        for h in np.arange(min_y - 0.5, max_y + 0.5, 0.1):
+            tdm = self._sim.pathfinder.get_topdown_view(meters_per_pixel=mpp, height=h)
+            area = int(tdm.sum())
+            if area > 50:
+                nav_heights.append((h, area))
+
+        if not nav_heights:
+            return [self._sim.get_agent(0).state.position[1]]
+
+        floors = []
+        cluster = [nav_heights[0]]
+        for h, area in nav_heights[1:]:
+            if h - cluster[-1][0] > 1.5:
+                best = max(cluster, key=lambda x: x[1])
+                floors.append(best[0])
+                cluster = [(h, area)]
+            else:
+                cluster.append((h, area))
+        if cluster:
+            floors.append(max(cluster, key=lambda x: x[1])[0])
+        return floors
+
+    def _get_floor_index(self, height):
+        best_idx = 0
+        min_dist = float('inf')
+        for i, fh in enumerate(self._floor_heights):
+            d = abs(height - fh)
+            if d < min_dist:
+                min_dist = d
+                best_idx = i
+        return best_idx
+
+    def _to_grid_floor(self, z, x):
+        return maps.to_grid(
+            z, x,
+            (self._floor_shape[0], self._floor_shape[1]),
+            sim=self._sim,
+        )
+
+    def _offset(self, gx, gy, floor_idx):
+        return gx, gy + self._floor_offsets[floor_idx]
+
+    def get_original_map(self):
+        self._floor_heights = self._detect_floors()
+        self._n_floors = len(self._floor_heights)
+
+        if self._n_floors <= 1:
+            self._floor_shape = None
+            self._floor_offsets = [0]
+            return super().get_original_map()
+
+        mpp = maps.calculate_meters_per_pixel(self._map_resolution, sim=self._sim)
+        floor_maps = []
+        for fh in self._floor_heights:
+            fm = maps.get_topdown_map(
+                self._sim.pathfinder, height=fh,
+                map_resolution=self._map_resolution,
+                draw_border=self._config.draw_border,
+                meters_per_pixel=mpp,
+            )
+            floor_maps.append(fm)
+
+        max_h = max(m.shape[0] for m in floor_maps)
+        max_w = max(m.shape[1] for m in floor_maps)
+        self._floor_shape = (max_h, max_w)
+
+        gap = 8
+        total_w = max_w * self._n_floors + gap * (self._n_floors - 1)
+        combined = np.zeros((max_h, total_w), dtype=np.uint8)
+
+        self._floor_offsets = []
+        for i, fm in enumerate(floor_maps):
+            col_off = i * (max_w + gap)
+            self._floor_offsets.append(col_off)
+            r0 = (max_h - fm.shape[0]) // 2
+            c0 = col_off + (max_w - fm.shape[1]) // 2
+            combined[r0:r0 + fm.shape[0], c0:c0 + fm.shape[1]] = fm
+
+        if self._config.fog_of_war.draw:
+            self._fog_of_war_mask = np.zeros_like(combined)
+        else:
+            self._fog_of_war_mask = None
+
+        return combined
+
+    def _draw_point(self, position, point_type):
+        if self._floor_shape is None:
+            return super()._draw_point(position, point_type)
+        fi = self._get_floor_index(position[1])
+        tx, ty = self._to_grid_floor(position[2], position[0])
+        tx, ty = self._offset(tx, ty, fi)
+        self._top_down_map[
+            tx - self.point_padding: tx + self.point_padding + 1,
+            ty - self.point_padding: ty + self.point_padding + 1,
+        ] = point_type
+
+    def _is_on_same_floor(self, height, ref_floor_height=None, ceiling_height=2.0):
+        if self._n_floors > 1:
+            return True
+        return super()._is_on_same_floor(height, ref_floor_height, ceiling_height)
+
+    def _draw_shortest_path(self, episode, agent_position):
+        if self._floor_shape is None:
+            return super()._draw_shortest_path(episode, agent_position)
+        if not self._config.draw_shortest_path:
+            return
+        pts_3d = self._sim.get_straight_shortest_path_points(
+            agent_position, episode.goals[0].position
+        )
+        if not pts_3d:
+            return
+
+        self._shortest_path_points = []
+        seg = []
+        cur_floor = self._get_floor_index(pts_3d[0][1])
+
+        for p in pts_3d:
+            fi = self._get_floor_index(p[1])
+            gx, gy = self._to_grid_floor(p[2], p[0])
+            gx, gy = self._offset(gx, gy, fi)
+            if fi != cur_floor and seg:
+                maps.draw_path(self._top_down_map, seg, maps.MAP_SHORTEST_PATH_COLOR, self.line_thickness)
+                seg = []
+                cur_floor = fi
+            seg.append((gx, gy))
+            self._shortest_path_points.append((gx, gy))
+
+        if seg:
+            maps.draw_path(self._top_down_map, seg, maps.MAP_SHORTEST_PATH_COLOR, self.line_thickness)
+
+    def _draw_goals_aabb(self, episode):
+        if self._floor_shape is None:
+            return super()._draw_goals_aabb(episode)
+        if not self._config.draw_goal_aabbs:
+            return
+        for goal in episode.goals:
+            try:
+                sem_scene = self._sim.semantic_annotations()
+                obj_id = goal.object_id
+                center = sem_scene.objects[obj_id].aabb.center
+                x_len, _, z_len = sem_scene.objects[obj_id].aabb.sizes / 2.0
+                fi = self._get_floor_index(center[1])
+                corners = [
+                    center + np.array([x, 0, z])
+                    for x, z in [(-x_len, -z_len), (-x_len, z_len), (x_len, z_len), (x_len, -z_len), (-x_len, -z_len)]
+                ]
+                mc = []
+                for c in corners:
+                    gx, gy = self._to_grid_floor(c[2], c[0])
+                    gx, gy = self._offset(gx, gy, fi)
+                    mc.append((gx, gy))
+                maps.draw_path(self._top_down_map, mc, maps.MAP_TARGET_BOUNDING_BOX, self.line_thickness)
+            except (AttributeError, IndexError):
+                pass
+
+    def update_map(self, agent_state, agent_index):
+        if self._floor_shape is None:
+            return super().update_map(agent_state, agent_index)
+
+        pos = agent_state.position
+        fi = self._get_floor_index(pos[1])
+        ax, ay = self._to_grid_floor(pos[2], pos[0])
+        ax, ay = self._offset(ax, ay, fi)
+
+        if self._top_down_map[ax, ay] != maps.MAP_SOURCE_POINT_INDICATOR:
+            color = 10 + min(self._step_count * 245 // self._config.max_episode_steps, 245)
+            if self._previous_xy_location[agent_index] is not None:
+                prev_fi = self._prev_floor.get(agent_index, fi)
+                if prev_fi == fi:
+                    cv2.line(
+                        self._top_down_map,
+                        self._previous_xy_location[agent_index],
+                        (ay, ax), color, thickness=self.line_thickness,
+                    )
+
+        angle = TopDownMap.get_polar_angle(agent_state)
+        self.update_fog_of_war_mask(np.array([ax, ay]), angle, fi)
+
+        self._previous_xy_location[agent_index] = (ay, ax)
+        self._prev_floor[agent_index] = fi
+        return ax, ay
+
+    def reset_metric(self, episode, *args, **kwargs):
+        self._prev_floor = {}
+        super().reset_metric(episode, *args, **kwargs)
+
+    def update_fog_of_war_mask(self, agent_position, angle, floor_idx=None):
+        if self._floor_shape is None or self._n_floors <= 1:
+            return super().update_fog_of_war_mask(agent_position, angle)
+        if not self._config.fog_of_war.draw:
+            return
+
+        if floor_idx is None:
+            agent_state = self._sim.get_agent(0).state
+            floor_idx = self._get_floor_index(agent_state.position[1])
+
+        col_off = self._floor_offsets[floor_idx]
+        fw = self._floor_shape[1]
+        fh = self._floor_shape[0]
+
+        floor_fog = self._fog_of_war_mask[:fh, col_off:col_off + fw].copy()
+        floor_map = self._top_down_map[:fh, col_off:col_off + fw].copy()
+
+        local_pos = np.array([agent_position[0], agent_position[1] - col_off])
+
+        floor_fog = fog_of_war.reveal_fog_of_war(
+            floor_map, floor_fog, local_pos, angle,
+            fov=self._config.fog_of_war.fov,
+            max_line_len=self._config.fog_of_war.visibility_dist
+            / maps.calculate_meters_per_pixel(self._map_resolution, sim=self._sim),
+        )
+        self._fog_of_war_mask[:fh, col_off:col_off + fw] = floor_fog

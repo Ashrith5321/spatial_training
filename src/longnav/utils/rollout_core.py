@@ -503,7 +503,6 @@ def collect_rollouts(
                     ray.get(wandb_logger.alert.remote(title="Rollout Collection Frozen",text=f"Active Episodes: {len(active_episodes)}, Pending PostProc: {len(pending_postproc)}",level="ERROR"))
                 # Check 1: Are we waiting on a specific ref forever?
                 # Dump the first few active refs to inspect
-                import ipdb; ipdb.set_trace()
 
             continue # Jump back to start of loop (and potentially dispatch more if resources freed up)
 

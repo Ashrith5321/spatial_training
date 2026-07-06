@@ -280,9 +280,11 @@ class ExpBootstrapper:
             # "automatic_object_spilling_enabled": False,
         }
         if res.ray_address == "local":
+            import torch
             ray.init(
+                num_gpus=torch.cuda.device_count(),
                 resources={
-                    res.vlm_resource_tag: res.num_vlms, 
+                    res.vlm_resource_tag: res.num_vlms,
                     res.sim_resource_tag: res.num_sims,
                 },
                 ignore_reinit_error=True,

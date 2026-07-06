@@ -144,14 +144,8 @@ def save_run_video(steps_data, filename, output_dir, fps=4, quality=6,return_thu
 
     texts = [
         [
-            f"episode: {steps_data['info'][0]['episode_label']} step: {idx}",
-            f"action: {action_list[int(action)]} @ P={probs[int(action)]:.3f}",
-            f"probs: {[f'{prob:.3f}' for prob in probs]}",
-            f"oracle: {action_list[int(info.get('oracle_action',0))]}",
-            f"distance_to_goal: {info.get('distance_to_goal',None)}",
-            f"distance_reward: {info.get('distance_to_goal_reward',None)}",
             f"goal: {obs['instr_or_goal']}",
-            f"spl: {steps_data['info'][-1].get('spl',None)}",
+            f"distance_to_goal: {info.get('distance_to_goal',None):.2f}" if info.get('distance_to_goal') is not None else "distance_to_goal: N/A",
         ]
         for idx, (action,probs,obs, info) in enumerate(zip(actions, action_probs, steps_data['obs'], steps_data['info']))
     ]
@@ -481,10 +475,12 @@ class HabitatWorker:
                 # 2. The Scene Assets (The folder containing .glb files)
                 # Example: "/mnt/data/habitat/scene_datasets/"
                 self.config_env.habitat.dataset.scenes_dir = scenes_dir
-            # Add TopDownMap for visualization
+            # Add TopDownMap for visualization (multi-floor aware)
             if add_top_down_map:
+                import longnav.utils.measures  # registers MultiFloorTopDownMap
                 self.config_env.habitat.task.measurements.top_down_map = (
                     TopDownMapMeasurementConfig(
+                        type="MultiFloorTopDownMap",
                         map_padding=3,
                         map_resolution=512,
                         draw_goal_positions=True,
@@ -617,10 +613,14 @@ class HabitatWorker:
         self.episode_counter = 0 #distinguish from "steps" concept per episode
 
         # Initialize Env
-        # self.env = Env(self.config_env, dataset)
         with suppress_cpp_output():
-            self.env = make_gym_from_config(self.config_env,dataset)
-            self._resolve_task_specific_logic() # dependent on the env, so use here
+            from habitat.core.environments import get_env_class
+            config = self.config_env
+            hab_cfg = config.habitat if "habitat" in config else config
+            env_class = get_env_class(hab_cfg.env_task)
+            self.env = env_class(config=hab_cfg, dataset=dataset)
+            self.env.seed(hab_cfg.seed)
+            self._resolve_task_specific_logic()
         self.nav_oracle = ObjectNavOracle(
             self.env.habitat_env,
             success_distance=self.config_env.habitat.task.measurements.success.success_distance, 
