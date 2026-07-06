@@ -340,7 +340,7 @@ class VLMWorker:
             "logits_to_keep": self._get_sparse_logit_indices().cpu()
         }
 
-    def infer_step(self,messages,images,full_logprobs=False,temperature=1.0,check_probs=True,crop_inputs=True,pos_id_kwargs=None):
+    def infer_step(self,messages,images,full_logprobs=False,temperature=1.0,check_probs=True,crop_inputs=True,pos_id_kwargs=None,ephemeral_messages=None):
         t0 = time.time()
         self.model.gradient_checkpointing_disable()
         self.model.eval()
@@ -360,16 +360,35 @@ class VLMWorker:
         # First we must crop the sequence so the turns properly lign up.
         logit_indices,prefix_starts,postfix_starts = self._get_sandwich_indices(turn_inputs['input_ids'])
         if crop_inputs:
-            if len(prefix_starts)>1:
-                turn_inputs['attention_mask'] = turn_inputs['attention_mask'][:,(postfix_starts[0]-1):(postfix_starts[-1]-1)]
-                turn_inputs["input_ids"] = turn_inputs['input_ids'][:,(postfix_starts[0]-1):(postfix_starts[-1]-1)]
-                if 'mm_token_type_ids' in turn_inputs.keys():
-                    turn_inputs["mm_token_type_ids"] = turn_inputs['mm_token_type_ids'][:,(postfix_starts[0]-1):(postfix_starts[-1]-1)] 
+            if ephemeral_messages is not None:
+                # Ephemeral mode: the persistent part excludes the trailing
+                # generation prefix (it terminates the ephemeral block instead and
+                # is evicted with it), so it must INCLUDE the leading assistant
+                # prefix of the action turn — the cache never kept the one fed
+                # last turn. Re-fed at the same positions, the streams align.
+                start = prefix_starts[0] if len(prefix_starts) > 1 else 0
+                end = prefix_starts[-1]
+            elif len(prefix_starts)>1:
+                start, end = postfix_starts[0]-1, postfix_starts[-1]-1
             else:
-                turn_inputs['attention_mask'] = turn_inputs['attention_mask'][:,:(postfix_starts[-1]-1)]
-                turn_inputs["input_ids"] = turn_inputs['input_ids'][:,:(postfix_starts[-1]-1)]
-                if 'mm_token_type_ids' in turn_inputs.keys():
-                    turn_inputs["mm_token_type_ids"] = turn_inputs['mm_token_type_ids'][:,:(postfix_starts[-1]-1)]
+                start, end = 0, postfix_starts[-1]-1
+            for k in ('input_ids','attention_mask','mm_token_type_ids'):
+                if k in turn_inputs.keys():
+                    turn_inputs[k] = turn_inputs[k][:,start:end]
+
+        # --- Ephemeral block (e.g. scene graph): fed together with this turn so
+        # the action logits can attend to it, then evicted from the KV cache.
+        # The persistent part is cut before the trailing generation prefix; the
+        # prefix instead terminates the ephemeral block, so everything cropped
+        # off the cache afterwards is [ephemeral user turn + generation prefix].
+        eph_inputs = None
+        n_ephemeral = 0
+        if ephemeral_messages is not None:
+            assert crop_inputs, "ephemeral_messages requires crop_inputs=True"
+            eph_inputs = self.tokenize_inputs(ephemeral_messages,None)
+            _,_,eph_postfix_starts = self._get_sandwich_indices(eph_inputs['input_ids'])
+            eph_inputs['input_ids'] = eph_inputs['input_ids'][:,:eph_postfix_starts[-1]-1]
+            n_ephemeral = eph_inputs['input_ids'].shape[1]
 
         t = time.time()
         self._accumulate_inputs(turn_inputs)
@@ -399,6 +418,23 @@ class VLMWorker:
         if self.save_outputs:
             turn_inputs['save_embeds'] = True
 
+        prev_cache_len = self.past_key_values.get_seq_length() if self.past_key_values is not None else 0
+        if eph_inputs is not None:
+            n_persistent = turn_inputs['input_ids'].shape[1]
+            eph_ids = eph_inputs['input_ids'].to(self.device)
+            # text-only block: sequential positions continuing after the persistent
+            # turn (self.offset was already advanced by _pos_id_fast); offset is NOT
+            # advanced for these, so next turn reuses the same positions.
+            eph_pos = torch.arange(self.offset, self.offset + n_ephemeral, device=self.device,
+                                   dtype=turn_inputs['position_ids'].dtype)
+            eph_pos = eph_pos.view(1,1,-1).expand(turn_inputs['position_ids'].shape[0],1,-1)
+            turn_inputs['input_ids'] = torch.cat([turn_inputs['input_ids'], eph_ids], dim=1)
+            turn_inputs['position_ids'] = torch.cat([turn_inputs['position_ids'], eph_pos], dim=-1)
+            if 'mm_token_type_ids' in turn_inputs.keys():
+                turn_inputs['mm_token_type_ids'] = torch.cat([turn_inputs['mm_token_type_ids'], torch.zeros_like(eph_ids)], dim=1)
+            if turn_inputs.get('attention_mask',None) is not None:
+                turn_inputs['attention_mask'] = torch.cat([turn_inputs['attention_mask'], torch.ones_like(eph_ids)], dim=1)
+
         with torch.inference_mode():
             t = time.time()
             outputs = self.model.forward(
@@ -426,6 +462,8 @@ class VLMWorker:
             if self.use_sparse:
                 t = time.time()
                 current_keep_mask = self.language_model.seq_keep_mask
+                if n_ephemeral:
+                    current_keep_mask = current_keep_mask[:-n_ephemeral] # ephemeral tokens are evicted below; track persistent only
                 self.vis_keep_masks.append(self.language_model.vis_keep_mask.cpu())
                 if self.seq_keep_mask is None:
                     self.seq_keep_mask = current_keep_mask.cpu()
@@ -437,6 +475,15 @@ class VLMWorker:
                     for idx, image_embeds in enumerate(self.language_model.kept_visual_embeds):
                         self.past_image_embeds[idx] = torch.cat((self.past_image_embeds[idx],image_embeds)) #handle the batching...
                 # print(f"store sparse states time: {time.time()-t}",end=" ")
+            if n_ephemeral:
+                # Evict the ephemeral tokens: the logits above already attended to
+                # them; cropping the cache makes the next turn continue as if they
+                # were never part of the conversation.
+                if self.use_sparse:
+                    kept_persistent = int(self.language_model.seq_keep_mask[:-n_ephemeral].sum().item())
+                else:
+                    kept_persistent = n_persistent
+                self.past_key_values.crop(prev_cache_len + kept_persistent)
         # if check_probs:
         #     try:
         #         assert(torch.argmax(logprobs,dim=-1).item() in self.vocab_ids)
