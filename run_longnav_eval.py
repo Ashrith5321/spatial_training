@@ -99,14 +99,6 @@ CONVO_TURN_TEMPLATE = [
     {"role": "assistant", "content": [{"type": "text", "text": "**forward**"}]},
 ]
 
-# Ephemeral mode: the scene graph is fed as its own user turn each step, and the
-# VLM worker evicts it from the KV cache right after the action is sampled — the
-# persistent context accumulates only images and actions.
-EPHEMERAL_SG_TEMPLATE = [
-    {"role": "user", "content": [{"type": "text", "text": "$scene_graph_text"}]},
-    {"role": "assistant", "content": [{"type": "text", "text": "**forward**"}]},
-]
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -125,9 +117,6 @@ def parse_args():
     parser.add_argument("--no-lora", action="store_true", help="Run base model without LoRA")
     parser.add_argument("--no-scene-graph", action="store_true",
                         help="Disable scene-graph injection (drops both the prompt section and per-step graph text)")
-    parser.add_argument("--ephemeral-scene-graph", action="store_true",
-                        help="Feed the scene graph as a per-step prompt that is evicted from the KV cache "
-                             "after each action (context accumulates only images+actions, always sees the freshest graph)")
     parser.add_argument("--dump-toon", action="store_true",
                         help="Write per-step scene-graph TOON to {stem}.toon.txt (off by default)")
     parser.add_argument("--wandb", action="store_true", help="Log live progress to Weights & Biases")
@@ -330,8 +319,7 @@ def get_goal_name(env, obs):
 # ---------- Episode runner ----------
 
 def run_episode(env, vlm, index, output_dir, max_steps, fps, temperature,
-                skip_video=False, gt_scene_graph=None, dump_toon=False,
-                ephemeral_scene_graph=False):
+                skip_video=False, gt_scene_graph=None, dump_toon=False):
     obs = env.reset()
     episode = env.current_episode
     scene = Path(episode.scene_id).name.replace(".basis.glb", "")
@@ -342,7 +330,7 @@ def run_episode(env, vlm, index, output_dir, max_steps, fps, temperature,
     if gt_scene_graph is not None:
         gt_scene_graph.reset_episode()
 
-    sg_log = []  # per-step scene-graph TOON blocks fed to the VLM (for inspection)
+    sg_log = [] 
 
     def scene_graph_text():
         if gt_scene_graph is None:
@@ -371,25 +359,15 @@ def run_episode(env, vlm, index, output_dir, max_steps, fps, temperature,
     # Reset VLM state (KV cache, position tracking)
     vlm.reset()
 
-    # Ephemeral mode: graph text goes into a separate per-step block the worker
-    # evicts from the KV cache after sampling; the persistent turn carries "".
-    def split_sg(sg_txt):
-        if ephemeral_scene_graph and gt_scene_graph is not None:
-            eph = substitute_convo_template(
-                EPHEMERAL_SG_TEMPLATE, {"scene_graph_text": sg_txt}
-            ) if sg_txt else None
-            return "", eph
-        return sg_txt, None
-
     # Build initial conversation
     system_prompt = Template(SYSTEM_PROMPT).substitute(
         instr_or_goal=goal, action_space_str=ACTION_SPACE_STR,
         scene_graph_section=SCENE_GRAPH_SECTION if gt_scene_graph is not None else "",
     )
-    persistent_sg, eph_messages = split_sg(scene_graph_text())
+    sg = scene_graph_text()
     messages = substitute_convo_template(
         CONVO_START_TEMPLATE,
-        {"system_prompt": system_prompt, "scene_graph_text": persistent_sg},
+        {"system_prompt": system_prompt, "scene_graph_text": sg},
     )
 
     started = time.time()
@@ -408,7 +386,6 @@ def run_episode(env, vlm, index, output_dir, max_steps, fps, temperature,
             rgb_pil = Image.fromarray(obs["rgb"])
             action_probs, action_logprobs, outputs = vlm.infer_probs(
                 images=[rgb_pil], messages=messages, temperature=temperature,
-                ephemeral_messages=eph_messages,
             )
 
             # Sample action
@@ -429,10 +406,10 @@ def run_episode(env, vlm, index, output_dir, max_steps, fps, temperature,
                 break
 
             # Build next turn messages
-            persistent_sg, eph_messages = split_sg(scene_graph_text())
+            sg = scene_graph_text()
             messages = substitute_convo_template(
                 CONVO_TURN_TEMPLATE,
-                {"action": action_name, "scene_graph_text": persistent_sg},
+                {"action": action_name, "scene_graph_text": sg},
             )
     finally:
         if writer:
@@ -525,8 +502,6 @@ def print_aggregate_stats(results_path):
 
 def main():
     args = parse_args()
-    if args.ephemeral_scene_graph and args.no_scene_graph:
-        raise ValueError("--ephemeral-scene-graph and --no-scene-graph are mutually exclusive")
     output_dir = (ROOT / args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     results_path = output_dir / "results.jsonl"
@@ -580,7 +555,7 @@ def main():
     banner = (
         f"LongNav R1 eval | model={args.base_model.split('/')[-1]} | "
         f"lora={'none' if args.no_lora else args.lora_checkpoint.split('/')[-1]} | "
-        f"scene_graph={'off' if args.no_scene_graph else ('ephemeral' if args.ephemeral_scene_graph else 'on')} | "
+        f"scene_graph={'off' if args.no_scene_graph else 'on'} | "
         f"episodes={total} | range=[{args.start}, {end}) | "
         f"already_complete={len(completed)} | max_steps={args.max_steps} | "
         f"temp={args.temperature} | video={'off' if args.no_video else 'on'}"
@@ -648,7 +623,6 @@ def main():
                         args.max_steps, args.fps, args.temperature,
                         args.no_video, gt_scene_graph=gt_scene_graph,
                         dump_toon=args.dump_toon,
-                        ephemeral_scene_graph=args.ephemeral_scene_graph,
                     )
                     append_jsonl(results_path, record)
                     log_wandb(record, index)
