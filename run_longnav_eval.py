@@ -527,7 +527,7 @@ def main():
         dataset.episodes, cycle=False, shuffle=False,
         group_by_scene=False, seed=17,
     )
-    gt_scene_graph = None if args.no_scene_graph else GTSceneGraphProvider()
+    gt_scene_graph = None if args.no_scene_graph else GTSceneGraphProvider(text_format="json")
 
     # Check for already completed episodes (resumability). Also seed running
     # aggregates so the wandb success-rate/SPL curves stay accurate across resumes.

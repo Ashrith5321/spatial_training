@@ -86,7 +86,7 @@ class HabitatBackend:
         self.env = habitat.Env(config=config, dataset=dataset)
         self.env.episode_iterator = EpisodeIterator(
             dataset.episodes, cycle=True, shuffle=False, group_by_scene=False, seed=17)
-        self.provider = GTSceneGraphProvider()
+        self.provider = GTSceneGraphProvider(text_format="json")
         self._obs = None
         # skip to the requested starting episode
         for _ in range(max(0, start)):
@@ -98,7 +98,9 @@ class HabitatBackend:
 
     def _accumulate(self):
         ep = self.env.current_episode
-        self.provider.describe(self.env.sim, ep.scene_id, self._obs["semantic"], self._agent_state())
+        sg_text = self.provider.describe(self.env.sim, ep.scene_id, self._obs["semantic"], self._agent_state())
+        # Echo the exact string the VLM would receive this step (model-facing JSON).
+        print(f"[step {self.provider.graph.step}] model SG: {sg_text}", flush=True)
 
     def reset(self):
         self._obs = self.env.reset()

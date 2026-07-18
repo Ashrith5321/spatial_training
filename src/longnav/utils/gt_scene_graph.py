@@ -16,6 +16,7 @@ Ported/adapted from:
   Navigation_scene_graph/gt_scene_graph/src/graph/scene_graph.py (room/object/edge design)
 """
 
+import json
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -383,6 +384,37 @@ class EpisodeSceneGraph:
         traj = [{"p": [t["pos"][0], t["pos"][2]], "h": t["heading"]} for t in self.trajectory]
         return {"meta": meta, "rooms": rooms, "objects": objects, "edges": edges, "traj": traj}
 
+    def to_json(self, agent_state) -> dict:
+        """Model-facing JSON scene graph -- the same content as `to_toon` (agent-
+        relative xyz, rounded to 2 dp by `_rel_xyz`), in JSON:
+
+            {"agent": {"id": "agent", "room": "room_16", "xyz": [-0.16, 0.0, -3.46]},
+             "rooms": {"room_14": [{"name": "cabinet", "xyz": [0.13, 0.98, -1.97]}, ...],
+                       ...},
+             "edges": ["room_13-room_14", "room_15-room_16"]}
+
+        This is the single renderer shared by the eval loop, the teleop server,
+        and the SFT data builder, so train == eval.
+        """
+        if self.current_room is None:
+            return {}
+        position, _, _ = _agent_frame(agent_state)
+        d = {
+            "agent": {"id": "agent", "room": f"room_{self.current_room}", "xyz": self._rel_xyz(position)},
+            "rooms": {
+                f"room_{rid}": [
+                    {"name": rec["category"], "xyz": self._rel_xyz(rec["center"])}
+                    for rec in self.rooms.get(rid, {}).values()
+                ]
+                for rid in self.room_order
+            },
+        }
+        if self.room_edges:
+            d["edges"] = sorted(
+                f"room_{min(a, b)}-room_{max(a, b)}" for a, b in (tuple(e) for e in self.room_edges)
+            )
+        return d
+
 
 class GTSceneGraphProvider:
     """Per-scene id->object cache plus the per-episode room/object graph.
@@ -395,7 +427,7 @@ class GTSceneGraphProvider:
     def __init__(self, min_pixels: int = 50, top_k: int = 6, text_format: str = "toon"):
         self.min_pixels = min_pixels
         self.top_k = top_k
-        self.text_format = text_format  # "toon" (default, fed to the VLM) or "nl"
+        self.text_format = text_format  # "toon" (default), "json" (viewer-format, fed to the VLM), or "nl"
         self._scene_id: Optional[str] = None
         self._id2obj: Dict[int, object] = {}
         self._room_names: Dict[int, str] = {}
@@ -416,7 +448,9 @@ class GTSceneGraphProvider:
         objects = objects_in_fov(semantic_img, self._id2obj, self.min_pixels, self.top_k)
         self.graph.update(objects)
 
-        if self.text_format == "toon":
+        if self.text_format == "json":
+            text = json.dumps(self.graph.to_json(agent_state))
+        elif self.text_format == "toon":
             visible_ids = {o["id"] for o in objects}
             text = self.graph.to_toon(agent_state, visible_ids=visible_ids)
         else:  # natural-language fallback
