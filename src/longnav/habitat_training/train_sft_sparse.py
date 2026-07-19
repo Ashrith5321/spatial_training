@@ -224,6 +224,14 @@ def parse_args():
     p.add_argument("--eval_max_samples", type=int, default=EVAL_MAX_SAMPLES, help="Eval subset size")
     p.add_argument("--print_config", action="store_true", help="Print config then exit")
     p.add_argument("--resume_path", type=str, default="",help = "checkpoint to resume")
+    p.add_argument(
+        "--scene_graph_dir",
+        type=str,
+        default="",
+        help="Dir of per-episode ground-truth scene-graph files. When set, messages are "
+             "rebuilt with the SAME per-step SG format eval feeds the model (train == eval). "
+             "Empty string = no scene graph (unchanged behavior).",
+    )
     return p.parse_args()
 
 
@@ -288,6 +296,20 @@ def main():
     # Load data from HF
     from datasets import load_from_disk, load_dataset, Sequence, Image,Value
     from utils.data_misc import decode_image_sequence
+    from utils.sg_injection import SGStore, make_sg_message_transform
+
+    # Build the scene-graph -> messages transform once (reused for train + eval).
+    # It rebuilds `messages` with the per-step GT scene graph in the exact format
+    # run_longnav_eval.py feeds the model, then applies dynamic image resizing.
+    sg_transform = None
+    if args.scene_graph_dir:
+        print(f"Scene graph ENABLED: loading SG files from {args.scene_graph_dir}")
+        _sg_store = SGStore(args.scene_graph_dir)
+        print(f"  SGStore indexed {len(_sg_store)} episodes")
+        sg_transform = make_sg_message_transform(
+            _sg_store, resize_transform=dynamic_resize_transform, require_match=True
+        )
+
     use_streaming = True
     if not os.path.exists(os.path.expanduser(args.train_dataset_dir)) and "/" in args.train_dataset_dir:
         print(f"Loading Train (Streaming): {args.train_dataset_dir}")
@@ -326,6 +348,8 @@ def main():
 
         # train_dataset = train_dataset.filter(lambda example:len(example['action_sequence'])>396,batch_size=10,writer_batch_size=10,num_proc=16)
         train_dataset = train_dataset.cast_column("images", Sequence(Image(decode=True)))
+        if sg_transform is not None:
+            train_dataset.set_transform(sg_transform)  # SG -> messages + resize, at load time
         # train_dataset.set_transform(dynamic_resize_transform)
     if args.eval_dataset_dir:
         if not os.path.exists(os.path.expanduser(args.eval_dataset_dir)) and "/" in args.eval_dataset_dir:
@@ -358,6 +382,8 @@ def main():
             eval_dataset = eval_dataset.filter(validate_episode_images, num_proc=32, desc="Img Verify",batch_size=10)
 
             eval_dataset = eval_dataset.cast_column("images", Sequence(Image()))
+            if sg_transform is not None:
+                eval_dataset.set_transform(sg_transform)  # SG -> messages + resize, at load time
             # eval_dataset.set_transform(dynamic_resize_transform)
     else:
         eval_dataset = None
